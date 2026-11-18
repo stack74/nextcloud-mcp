@@ -1,0 +1,61 @@
+{
+  "name": "nextcloud-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Nextcloud files: list, search, read, preview, download, upload, create, move and delete. Local (stdio) or hosted (Streamable HTTP + OAuth); people sign in with their own Nextcloud login.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "nextcloud-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "prepare": "npm run build",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test --test-timeout=60000 --test-force-exit \"test/*.test.mjs\"",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "modelcontextprotocol",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "claude-desktop",
+    "nextcloud",
+    "webdav",
+    "files",
+    "oauth"
+  ],
+  "author": "stack74",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stack74/nextcloud-mcp.git"
+  },
+  "homepage": "https://github.com/stack74/nextcloud-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/stack74/nextcloud-mcp/issues"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "express": "^5.3.0",
+    "fast-xml-parser": "^5.12.1",
+    "unpdf": "~1.9.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
