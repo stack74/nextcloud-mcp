@@ -17,6 +17,7 @@ export const SERVER_INSTRUCTIONS = `This server gives access to the files of ONE
 
 - \`nextcloud_read_file\` returns text for text files, PDFs, Word, Excel, PowerPoint and OpenDocument files, and the image itself for pictures. Long content comes in chunks: follow the offset it gives you instead of guessing.
 - Scanned PDFs have no text layer -> look at them with \`nextcloud_get_preview\`.
+- To look at or compare several pictures (photos, product images, scans, slides), use \`nextcloud_get_previews\` with a folder or a list of paths: one call, numbered thumbnails. \`include_previews\` on list/search adds a few small ones to the results.
 - Paths are case-sensitive and start at the user's root, e.g. "/Documents/Offer 2026.pdf". Copy them exactly from list/search results.
 
 # Changing files (only if the write tools are present)

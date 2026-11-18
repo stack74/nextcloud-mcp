@@ -8,7 +8,7 @@ import { extractKind, extractText } from "../services/extract.js";
 import { type ResponseFormat, type ToolResult, buildResult } from "../services/format.js";
 import { displayPath, normalizePath } from "../services/paths.js";
 import { type FileEntry, MIME_GROUPS, type SearchCondition, mimeConditions, search } from "../services/webdav.js";
-import { decodeText, formatSchema, webUrl } from "./files.js";
+import { decodeText, formatSchema, mapLimit, webUrl } from "./files.js";
 import { readCapped } from "./transfer.js";
 import { type Args, registerRead } from "./registry.js";
 
@@ -43,18 +43,6 @@ function findMatches(text: string, needle: string, caseSensitive: boolean, max: 
   return { matches, count };
 }
 
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next++;
-      results[index] = await fn(items[index]!);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
 
 interface Provider {
   id: string;

@@ -9,6 +9,7 @@ import {
   RESPONSE_FORMATS,
   type ResponseFormat,
   type Record_,
+  type ToolContent,
   type ToolResult,
   buildResult,
   compactEntry,
@@ -132,6 +133,71 @@ async function downloadBytes(client: NextcloudClient, path: string, max: number,
   return readCapped(response, max, label);
 }
 
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/** Files Nextcloud can render a thumbnail for (images, PDFs, office files … depending on the server). */
+const previewable = (e: FileEntry): boolean => e.type === "file" && (e.has_preview || (e.mime?.startsWith("image/") ?? false));
+
+/**
+ * Thumbnails of several files as content blocks: a numbered label before each
+ * image, so the model can tell which picture belongs to which file.
+ */
+async function previewGallery(
+  client: NextcloudClient,
+  entries: FileEntry[],
+  size: number,
+  label: (entry: FileEntry) => string = (e) => displayPath(e.path),
+): Promise<{ content: ToolContent[]; shown: FileEntry[]; missing: FileEntry[] }> {
+  const fetched = await mapLimit(entries, 6, async (entry) => (previewable(entry) ? fetchPreview(client, entry, size).catch(() => undefined) : undefined));
+  const content: ToolContent[] = [];
+  const shown: FileEntry[] = [];
+  const missing: FileEntry[] = [];
+  entries.forEach((entry, i) => {
+    const preview = fetched[i];
+    if (!preview) {
+      missing.push(entry);
+      return;
+    }
+    shown.push(entry);
+    content.push({ type: "text", text: `#${shown.length} ${label(entry)} — ${formatBytes(entry.size)}, ${formatDate(entry.modified)}` });
+    content.push({ type: "image", data: preview.data.toString("base64"), mimeType: preview.mime });
+  });
+  return { content, shown, missing };
+}
+
+/** Appends up to `max` thumbnails of `entries` to a list/search result. */
+async function withPreviews(result: ToolResult, client: NextcloudClient, entries: FileEntry[], max: number): Promise<ToolResult> {
+  const candidates = entries.filter(previewable).slice(0, max);
+  if (candidates.length === 0) {
+    result.content.push({ type: "text", text: "(No previews: none of these entries has a thumbnail.)" });
+    return result;
+  }
+  const gallery = await previewGallery(client, candidates, PREVIEW_LIST_SIZE);
+  result.content.push({ type: "text", text: `Previews of the first ${gallery.shown.length} previewable entries:` }, ...gallery.content);
+  return result;
+}
+
+const PREVIEW_LIST_SIZE = 256;
+const PREVIEW_LIST_MAX = 8;
+const includePreviewsSchema = z
+  .boolean()
+  .default(false)
+  .describe(
+    `Also return small thumbnails (${PREVIEW_LIST_SIZE} px) of the first ${PREVIEW_LIST_MAX} entries that have one, to judge them visually. ` +
+      "For more or larger thumbnails use nextcloud_get_previews.",
+  );
+
 function slice(text: string, offset: number, maxChars: number): { part: string; end: number; total: number } {
   const total = text.length;
   const start = Math.min(offset, total);
@@ -157,6 +223,7 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
         sort: z.enum(["name", "newest", "oldest", "largest"]).default("name").describe("Sort order; 'name' lists folders first."),
         limit: z.number().int().min(1).max(500).default(100).describe("Maximum entries to return (default 100)."),
         offset: z.number().int().min(0).default(0).describe("Skip this many entries, for paging."),
+        include_previews: includePreviewsSchema,
         response_format: formatSchema,
       },
     },
@@ -192,7 +259,7 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
         ...(self ? { folder_size: self.size } : {}),
         items: page.map(compactEntry),
       };
-      return buildResult(data, args.response_format as ResponseFormat, () => {
+      const listed = buildResult(data, args.response_format as ResponseFormat, () => {
         if (page.length === 0) return `Folder ${displayPath(path)} is empty${args.type !== "all" ? ` (no ${String(args.type)})` : ""}.`;
         return [
           `# ${displayPath(path)} — ${page.length} of ${children.length} entries${self ? `, ${formatBytes(self.size)} in total` : ""}`,
@@ -201,6 +268,7 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
           hasMore ? `\nMore entries: call again with offset=${offset + page.length}.` : "",
         ].join("\n");
       }, "entries");
+      return args.include_previews ? withPreviews(listed, client, page, PREVIEW_LIST_MAX) : listed;
     },
   );
 
@@ -266,6 +334,7 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
         sort: z.enum(["newest", "oldest", "name", "largest"]).default("newest"),
         limit: z.number().int().min(1).max(200).default(30),
         offset: z.number().int().min(0).default(0).describe("Skip this many results, for paging."),
+        include_previews: includePreviewsSchema,
         response_format: formatSchema,
       },
     },
@@ -303,7 +372,7 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
         ...(hasMore ? { next_offset: offset + results.length } : {}),
         items: results.map((e) => ({ ...compactEntry(e), web_url: webUrl(client, e) })),
       };
-      return buildResult(data, args.response_format as ResponseFormat, () => {
+      const found = buildResult(data, args.response_format as ResponseFormat, () => {
         if (results.length === 0) {
           return `Nothing found${args.query ? ` for '${String(args.query)}'` : ""} below ${displayPath(scope)}. ` +
             "Try fewer or shorter words, another type, or a wider folder.";
@@ -315,6 +384,7 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
           hasMore ? `\nMore results: call again with offset=${offset + results.length}.` : "",
         ].join("\n");
       }, "results");
+      return args.include_previews ? withPreviews(found, client, results, PREVIEW_LIST_MAX) : found;
     },
   );
 
@@ -423,6 +493,79 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
       return {
         content: [{ type: "text", text: `${header}${part}${footer}` }],
         structuredContent: { path: displayPath(path), mime: entry.mime, offset: start, end, total_chars: total, has_more: end < total, ...(end < total ? { next_offset: end } : {}) },
+      };
+    },
+  );
+
+  registerRead(
+    server,
+    {
+      name: "nextcloud_get_previews",
+      title: "Thumbnails of several files",
+      description:
+        "Thumbnails of up to 24 files in one call — to look through photos, product images, scans or slides and " +
+        "compare them, pick the right one, or describe what a folder contains.\n\n" +
+        "Pass either 'paths' (from list/search results) or 'folder' (its files, not recursive). Each image comes " +
+        "after a numbered line '#n /path — size, date', so refer to pictures by that number or path. Files without " +
+        "a thumbnail (Nextcloud renders images, PDFs, office files and videos, depending on the server) are listed " +
+        "at the end. Each thumbnail costs context: keep 'size' small (default 384 px) for an overview and use " +
+        "nextcloud_get_preview or nextcloud_read_file for one picture in detail.",
+      inputSchema: {
+        paths: z.array(z.string().min(1)).min(1).max(24).optional().describe("File paths, e.g. from nextcloud_search_files."),
+        folder: z.string().optional().describe("A folder whose files to show instead of 'paths' (not recursive), e.g. '/Photos/2026'."),
+        size: z.number().int().min(64).max(1024).default(384).describe("Longest edge in pixels (64-1024, default 384)."),
+        limit: z.number().int().min(1).max(24).default(12).describe("With 'folder': how many files at most (default 12)."),
+        offset: z.number().int().min(0).default(0).describe("With 'folder': skip this many previewable files, for paging."),
+      },
+    },
+    async (args: Args): Promise<ToolResult> => {
+      const size = args.size as number;
+      const paths = args.paths as string[] | undefined;
+      const folder = args.folder as string | undefined;
+      if (Boolean(paths?.length) === (folder !== undefined)) {
+        return textResult("Error: pass either 'paths' or 'folder'.", true);
+      }
+
+      let entries: FileEntry[];
+      let note = "";
+      let where = "";
+      if (paths) {
+        const normalised = paths.map((p) => normalizePath(p));
+        const stats = await mapLimit(normalised, 6, (p) => stat(client, p));
+        const unknown = normalised.filter((_, i) => !stats[i]);
+        entries = stats.filter((e): e is FileEntry => e !== undefined);
+        if (unknown.length) note = `\nNot found: ${unknown.map(displayPath).join(", ")}`;
+      } else {
+        const dir = normalizePath(folder);
+        const all = await propfind(client, dir, 1);
+        const self = all.find((e) => e.path === dir);
+        if (self?.type === "file") return textResult(`${displayPath(dir)} is a file. Use 'paths' instead.`, true);
+        const files = all
+          .filter((e) => e.path !== dir && previewable(e))
+          .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+        const offset = args.offset as number;
+        const limit = args.limit as number;
+        entries = files.slice(offset, offset + limit);
+        if (offset + entries.length < files.length) {
+          note = `\n${files.length - offset - entries.length} more previewable file(s): call again with offset=${offset + entries.length}.`;
+        }
+        if (files.length === 0) return textResult(`No files with thumbnails in ${displayPath(dir)}.`);
+        where = ` from ${displayPath(dir)}`;
+      }
+
+      // In folder mode the folder is named once; labels only carry the file name.
+      const gallery = await previewGallery(client, entries, size, where ? (e) => e.name : undefined);
+      const missing = gallery.missing.length ? `\nNo thumbnail for: ${gallery.missing.map((e) => displayPath(e.path)).join(", ")}` : "";
+      return {
+        content: [
+          { type: "text", text: `${gallery.shown.length} thumbnail${gallery.shown.length === 1 ? "" : "s"}${where} (${size} px), numbered #1–#${gallery.shown.length}:` },
+          ...gallery.content,
+          ...(missing || note ? [{ type: "text" as const, text: `${missing}${note}`.trim() }] : []),
+        ],
+        structuredContent: {
+          shown: gallery.shown.map((e, i) => ({ n: i + 1, path: displayPath(e.path), size: e.size, modified: e.modified, mime: e.mime })),
+          missing: gallery.missing.map((e) => displayPath(e.path)),
+        },
       };
     },
   );

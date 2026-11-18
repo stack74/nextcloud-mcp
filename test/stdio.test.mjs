@@ -35,6 +35,9 @@ before(async () => {
   nc.addFile("alice", "Documents/Brief.odt", odt("Hallo &amp; Tschüss"), "application/vnd.oasis.opendocument.text");
   nc.addFile("alice", "Scans/Rechnung 2026-01.pdf", pdf("Rechnung Nr. 2026-01 an Müller"), "application/pdf");
   nc.addFile("alice", "Photos/beach.png", Buffer.from("fakepng"), "image/png");
+  nc.addFile("alice", "Photos/red-chair.jpg", Buffer.from("fakejpg"), "image/jpeg");
+  nc.addFile("alice", "Photos/blue-lamp.webp", Buffer.from("fakewebp"), "image/webp");
+  nc.addFile("alice", "Photos/notes.txt", "no thumbnail", "text/plain");
   nc.addFile("alice", "Old/windows.csv", Buffer.from("Name;Stadt\nJürgen;Köln\n", "latin1"), "text/csv");
   nc.addFile("bob", "secret.txt", "bob only", "text/plain");
 });
@@ -116,6 +119,38 @@ describe("reading", () => {
     const preview = await s.callTool("nextcloud_get_preview", { path: "/Scans/Rechnung 2026-01.pdf", size: 256 });
     assert.equal(preview.result.content[1].type, "image");
     assert.ok(nc.state.requests.some((r) => r.path === "/index.php/core/preview"));
+  });
+
+  it("returns several numbered thumbnails at once", async () => {
+    const res = await s.callTool("nextcloud_get_previews", { folder: "/Photos", size: 128 });
+    const blocks = res.result.content;
+    const images = blocks.filter((b) => b.type === "image");
+    assert.equal(images.length, 3, "three images in /Photos, the text file has no thumbnail");
+    const labels = blocks.filter((b) => b.type === "text").map((b) => b.text);
+    assert.match(labels[0], /3 thumbnails from \/Photos \(128 px\), numbered #1–#3/);
+    // each image is preceded by its label
+    const firstImage = blocks.findIndex((b) => b.type === "image");
+    assert.match(blocks[firstImage - 1].text, /^#1 beach\.png — /);
+    assert.deepEqual(res.result.structuredContent.shown.map((e) => e.path), ["/Photos/beach.png", "/Photos/blue-lamp.webp", "/Photos/red-chair.jpg"]);
+    const previewCalls = nc.state.requests.filter((r) => r.path === "/index.php/core/preview").length;
+    assert.ok(previewCalls >= 3);
+
+    const byPath = await s.callTool("nextcloud_get_previews", { paths: ["/Photos/red-chair.jpg", "/Photos/notes.txt", "/nope.png"] });
+    const text = byPath.result.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+    assert.equal(byPath.result.content.filter((b) => b.type === "image").length, 1);
+    assert.match(text, /No thumbnail for: \/Photos\/notes\.txt/);
+    assert.match(text, /Not found: \/nope\.png/);
+    const both = await s.callTool("nextcloud_get_previews", { paths: ["/a"], folder: "/" });
+    assert.equal(both.result.isError, true);
+  });
+
+  it("adds thumbnails to list and search results on request", async () => {
+    const listed = await s.callTool("nextcloud_list_files", { path: "/Photos", include_previews: true });
+    assert.equal(listed.result.content.filter((b) => b.type === "image").length, 3);
+    const found = await s.callTool("nextcloud_search_files", { type: "image", include_previews: true });
+    assert.ok(found.result.content.filter((b) => b.type === "image").length >= 3);
+    const plain = await s.callTool("nextcloud_search_files", { type: "image" });
+    assert.equal(plain.result.content.filter((b) => b.type === "image").length, 0, "no thumbnails unless asked");
   });
 
   it("searches by name (all words), type and recency", async () => {

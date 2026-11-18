@@ -11,7 +11,7 @@
  *   GET  /healthz                                           liveness
  */
 
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import express, { type Request, type Response } from "express";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
@@ -33,7 +33,7 @@ import {
 import { type HostedConfig, loadHostedConfig } from "./config.js";
 import { renderConsentPage, renderDeniedPage, renderLoginFlowPage, renderMessage, setPageIcon } from "./pages.js";
 import { HostedOAuthProvider } from "./provider.js";
-import { type GrantRow, type SessionRow, Store, sha256 } from "./store.js";
+import { type GrantRow, type SessionRow, Store } from "./store.js";
 import { GrantCredentials, NextcloudOAuth, UpstreamOAuthError } from "./upstream.js";
 
 export interface HostedApp {
@@ -191,16 +191,26 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
   //
   // Before anything goes to Nextcloud, the person sees which client asks and
   // where the access will end up (MCP security best practices: a proxy must get
-  // consent per dynamically registered client). The form carries a CSRF token
-  // that must match a SameSite=Strict cookie, so another site cannot submit the
-  // consent on the person's behalf and drop them straight into the Nextcloud login.
+  // consent per dynamically registered client).
+  //
+  // The consent form is CSRF-protected. Whoever started /authorize knows the
+  // session id and can open the page too, so the token must not depend on the
+  // session alone: it is HMAC(secret, sid + a random per-browser nonce), and the
+  // nonce lives in an HttpOnly cookie. Over https the cookie carries the __Host-
+  // prefix (Secure, Path=/, no Domain), so a sibling subdomain — which counts as
+  // the same site — cannot plant a nonce of its choosing either.
 
-  const CONSENT_COOKIE = "ncmcp_consent";
-  const consentCookiePath = (sid: string): string => `/connect/${encodeURIComponent(sid)}`;
+  const BROWSER_COOKIE = config.publicUrl.protocol === "https:" ? "__Host-ncmcp_browser" : "ncmcp_browser";
+  const NONCE = /^[A-Za-z0-9_-]{43}$/;
   const readCookie = (req: Request, name: string): string | undefined => {
     for (const part of (req.headers.cookie ?? "").split(";")) {
       const [key, ...rest] = part.trim().split("=");
-      if (key === name) return decodeURIComponent(rest.join("="));
+      if (key !== name) continue;
+      try {
+        return decodeURIComponent(rest.join("="));
+      } catch {
+        return undefined;
+      }
     }
     return undefined;
   };
@@ -209,16 +219,25 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     const y = Buffer.from(b);
     return x.length === y.length && timingSafeEqual(x, y);
   };
+  const consentToken = (sid: string, nonce: string): string =>
+    createHmac("sha256", config.secret).update(`consent:${sid}:${nonce}`).digest("base64url");
 
-  const showConsent = (res: Response, session: SessionRow): void => {
-    const token = store.createConsentToken(session.id);
-    res.cookie(CONSENT_COOKIE, token, {
+  /** The browser's nonce, set (or refreshed) on the response. */
+  const browserNonce = (req: Request, res: Response): string => {
+    const existing = readCookie(req, BROWSER_COOKIE);
+    const nonce = existing && NONCE.test(existing) ? existing : randomBytes(32).toString("base64url");
+    res.cookie(BROWSER_COOKIE, nonce, {
       httpOnly: true,
       secure: config.publicUrl.protocol === "https:",
-      sameSite: "strict",
-      path: consentCookiePath(session.id),
-      maxAge: 30 * 60 * 1000,
+      sameSite: "lax",
+      path: "/",
+      maxAge: 24 * 3600 * 1000,
     });
+    return nonce;
+  };
+
+  const showConsent = (req: Request, res: Response, session: SessionRow): void => {
+    const token = consentToken(session.id, browserNonce(req, res));
     pageHeaders(res);
     res.type("html").send(
       renderConsentPage({
@@ -236,8 +255,8 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     const session = store.getSession(String(req.params.sid));
     if (!session) return expired(res);
     const form = typeof req.body?.csrf === "string" ? req.body.csrf : "";
-    const cookie = readCookie(req, CONSENT_COOKIE) ?? "";
-    const valid = Boolean(form) && sameToken(form, cookie) && session.consent_token_hash !== null && sameToken(sha256(form), session.consent_token_hash);
+    const nonce = readCookie(req, BROWSER_COOKIE) ?? "";
+    const valid = NONCE.test(nonce) && Boolean(form) && sameToken(form, consentToken(session.id, nonce));
     if (!valid) {
       console.error(`Consent refused for session (client ${session.client_id}): CSRF token missing or wrong`);
       pageHeaders(res);
@@ -245,14 +264,13 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
       return;
     }
     store.markConsented(session.id);
-    res.clearCookie(CONSENT_COOKIE, { path: consentCookiePath(session.id) });
     res.redirect(303, `/connect/${encodeURIComponent(session.id)}`);
   });
 
   app.get("/connect/:sid", async (req, res) => {
     const session = store.getSession(String(req.params.sid));
     if (!session) return expired(res);
-    if (!session.consented) return showConsent(res, session);
+    if (!session.consented) return showConsent(req, res, session);
 
     if (oauth) {
       res.redirect(303, oauth.authorizationUrl(store.createUpstreamState(session.id)));

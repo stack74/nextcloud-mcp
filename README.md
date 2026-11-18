@@ -93,8 +93,9 @@ access, and the code would end up with the attacker. Two independent checks prev
   narrowing the list also locks out clients registered earlier. Loopback addresses are allowed because a code sent
   there can only reach the signing-in person's own machine.
 - **Consent page.** Before forwarding to Nextcloud the person sees the app's (self-declared) name and, more
-  importantly, the address the access goes to. The form is protected by a CSRF token bound to a `SameSite=Strict`
-  cookie, so another site cannot submit the consent on the person's behalf.
+  importantly, the address the access goes to. The form's CSRF token is derived from the session and a random
+  per-browser nonce kept in an HttpOnly cookie — `__Host-` prefixed over https, so not even a sibling subdomain can
+  plant one. Whoever started the sign-in can read the page's token, but only for their own browser.
 
 Other measures: Nextcloud credentials are stored AES-256-GCM encrypted; tokens issued to MCP clients are stored as
 SHA-256 hashes; refused sign-ins (allowlists) are revoked in Nextcloud immediately; the sign-in pages send a strict
@@ -106,9 +107,10 @@ CSP and cannot be framed.
 |---|---|
 | `nextcloud_list_files` | One folder's content, sortable, paged |
 | `nextcloud_get_file_info` | Size, owner, permissions, flags, link into the web UI |
-| `nextcloud_search_files` | Server-side search by name (all words, `*` wildcard), type, date, favorites; without a query: recent files |
+| `nextcloud_search_files` | Server-side search by name (all words, `*` wildcard), type, date, favorites; without a query: recent files. `include_previews` adds thumbnails (also on `nextcloud_list_files`) |
 | `nextcloud_read_file` | Text of text files, PDF, docx/xlsx/pptx, odt/ods/odp; images as image; long content in chunks |
 | `nextcloud_get_preview` | Thumbnail from Nextcloud's preview generator (photos, first PDF page, office, video) |
+| `nextcloud_get_previews` | Up to 24 numbered thumbnails in one call — for a folder or a list of paths — to compare pictures |
 | `nextcloud_download_file` | Local: streamed to a path. Hosted: returned inline (≤ 10 MB) |
 | `nextcloud_search_file_contents` | Finds a phrase inside the newest readable files below a folder, with matching lines |
 | `nextcloud_unified_search` | Nextcloud's search box across apps (files, calendar, contacts, Talk, Deck, full-text index …) |

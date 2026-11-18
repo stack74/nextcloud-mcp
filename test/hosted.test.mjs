@@ -93,7 +93,7 @@ async function consent(connectUrl) {
   const page = await fetch(connectUrl);
   const html = await page.text();
   assert.match(html, /Allow access to your Nextcloud\?/);
-  const cookie = /ncmcp_consent=[^;]+/.exec(page.headers.get("set-cookie") ?? "")?.[0];
+  const cookie = /ncmcp_browser=[^;]+/.exec(page.headers.get("set-cookie") ?? "")?.[0];
   const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
   assert.ok(cookie && csrf, "consent page must set a cookie and carry a CSRF token");
   const res = await fetch(`${connectUrl}/consent`, {
@@ -389,21 +389,66 @@ describe("hosted mode: who may receive the access (confused deputy)", () => {
       assert.match(html, /your own computer<\/b> \(localhost:9999\)/);
       assert.doesNotMatch(html, /login\/v2\/flow/, "no Nextcloud login before consent");
       assert.equal(nc.state.flows.size, 0, "no login flow started before consent");
-      assert.match(page.headers.get("set-cookie") ?? "", /HttpOnly; SameSite=Strict/i);
-      const csrf = /name="csrf" value="([^"]+)"/.exec(html)[1];
+      const setCookie = page.headers.get("set-cookie") ?? "";
+      assert.match(setCookie, /^ncmcp_browser=[A-Za-z0-9_-]{43}; Max-Age=86400; Path=\/; Expires=[^;]+; HttpOnly; SameSite=Lax$/);
+      const attackerCookie = /ncmcp_browser=[^;]+/.exec(setCookie)[0];
+      const attackerToken = /name="csrf" value="([^"]+)"/.exec(html)[1];
 
-      // A cross-site form post carries the token from the page source at best, never the Strict cookie.
-      const forged = await fetch(`${connectUrl}/consent`, {
-        method: "POST",
-        redirect: "manual",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ csrf }),
-      });
-      assert.equal(forged.status, 403);
+      // The attacker started /authorize, so they can open the page and read a token — for THEIR browser.
+      const victimPage = await fetch(connectUrl);
+      const victimCookie = /ncmcp_browser=[^;]+/.exec(victimPage.headers.get("set-cookie") ?? "")[0];
+      const victimToken = /name="csrf" value="([^"]+)"/.exec(await victimPage.text())[1];
+      const post = (cookie, csrf) =>
+        fetch(`${connectUrl}/consent`, {
+          method: "POST",
+          redirect: "manual",
+          headers: { "Content-Type": "application/x-www-form-urlencoded", ...(cookie ? { Cookie: cookie } : {}) },
+          body: new URLSearchParams({ csrf }),
+        });
+      assert.equal((await post(undefined, attackerToken)).status, 403, "no cookie (cross-site, or cookie blocked)");
+      assert.equal((await post(victimCookie, attackerToken)).status, 403, "attacker's token with the victim's cookie");
+      assert.equal((await post(attackerCookie, victimToken)).status, 403, "token of another browser");
+      assert.equal((await post("ncmcp_browser=short", attackerToken)).status, 403, "malformed nonce");
       const stillConsent = await (await fetch(connectUrl)).text();
       assert.match(stillConsent, /Allow access to your Nextcloud/);
+      assert.equal((await post(victimCookie, victimToken)).status, 303, "the right browser can consent");
     } finally {
       server.stop();
+    }
+  });
+});
+
+describe("hosted mode over https: the consent cookie cannot be planted by a sibling subdomain", () => {
+  it("uses a __Host- cookie (Secure, Path=/, no Domain)", async () => {
+    const nc = await startFakeNextcloud();
+    const port = await freePort();
+    const publicUrl = `https://127.0.0.1:${port}`;
+    const server = await startHosted({ NEXTCLOUD_URL: nc.base, NEXTCLOUD_MCP_PUBLIC_URL: publicUrl }, { port });
+    try {
+      const plain = `http://127.0.0.1:${port}`; // requested directly, as a TLS proxy would
+      const registered = await fetch(`${plain}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ redirect_uris: [REDIRECT], token_endpoint_auth_method: "none", grant_types: ["authorization_code"], response_types: ["code"] }),
+      });
+      const clientId = (await registered.json()).client_id;
+      const url = new URL(`${plain}/authorize`);
+      url.search = new URLSearchParams({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: REDIRECT,
+        code_challenge: "x".repeat(43),
+        code_challenge_method: "S256",
+        resource: `${publicUrl}/mcp`,
+      }).toString();
+      const res = await fetch(url, { redirect: "manual" });
+      const page = await fetch(new URL(res.headers.get("location"), plain));
+      const setCookie = page.headers.get("set-cookie") ?? "";
+      assert.match(setCookie, /^__Host-ncmcp_browser=[A-Za-z0-9_-]{43}; Max-Age=86400; Path=\/; Expires=[^;]+; HttpOnly; Secure; SameSite=Lax$/);
+      assert.doesNotMatch(setCookie, /Domain=/i);
+    } finally {
+      server.stop();
+      nc.close();
     }
   });
 });

@@ -35,7 +35,7 @@ export interface SessionRow {
   poll_expires_at: number | null;
   /** The person approved this client on the consent page. */
   consented: boolean;
-  /** SHA-256 of the consent form's CSRF token (also sent as a SameSite=Strict cookie). */
+  /** Unused since 1.0.3 (the consent token is now derived from a browser nonce); kept for old databases. */
   consent_token_hash: string | null;
   expires_at: number;
 }
@@ -182,15 +182,8 @@ export class Store {
       .run(loginUrl, this.encrypt(pollToken), expiresAt, sessionId);
   }
 
-  /** Starts a consent form: returns the CSRF token for the form and the cookie. */
-  createConsentToken(sessionId: string): string {
-    const token = randomToken();
-    this.db.prepare("UPDATE sessions SET consent_token_hash = ? WHERE id = ?").run(sha256(token), sessionId);
-    return token;
-  }
-
   markConsented(sessionId: string): void {
-    this.db.prepare("UPDATE sessions SET consented = 1, consent_token_hash = NULL WHERE id = ?").run(sessionId);
+    this.db.prepare("UPDATE sessions SET consented = 1 WHERE id = ?").run(sessionId);
   }
 
   /** OAuth mode: the `state` sent to Nextcloud. Returns the value to send. */
