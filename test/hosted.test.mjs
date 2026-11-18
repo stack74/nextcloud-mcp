@@ -28,9 +28,9 @@ function freePort() {
   });
 }
 
-async function startHosted(env) {
-  const port = await freePort();
-  const dir = mkdtempSync(path.join(tmpdir(), "nc-mcp-hosted-"));
+async function startHosted(env, options = {}) {
+  const port = options.port ?? (await freePort());
+  const dir = options.dir ?? mkdtempSync(path.join(tmpdir(), "nc-mcp-hosted-"));
   const base = `http://127.0.0.1:${port}`;
   const child = spawn("node", [SERVER_ENTRY, "--http"], {
     env: {
@@ -60,22 +60,24 @@ async function startHosted(env) {
     get stderr() {
       return stderr;
     },
-    stop() {
+    port,
+    dir,
+    stop({ keepData = false } = {}) {
       child.kill();
-      rmSync(dir, { recursive: true, force: true });
+      if (!keepData) rmSync(dir, { recursive: true, force: true });
     },
   };
 }
 
 /** Registers an MCP client and starts /authorize; returns the sign-in page URL and the PKCE verifier. */
-async function beginAuthorization(base, clientId) {
+async function beginAuthorization(base, clientId, redirect = REDIRECT) {
   const verifier = randomBytes(32).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const url = new URL(`${base}/authorize`);
   url.search = new URLSearchParams({
     response_type: "code",
     client_id: clientId,
-    redirect_uri: REDIRECT,
+    redirect_uri: redirect,
     code_challenge: challenge,
     code_challenge_method: "S256",
     state: "st4te",
@@ -84,6 +86,39 @@ async function beginAuthorization(base, clientId) {
   const res = await fetch(url, { redirect: "manual" });
   assert.equal(res.status, 302);
   return { connectUrl: new URL(res.headers.get("location"), base).href, verifier };
+}
+
+/** The consent page: approves it (with the CSRF cookie, as a browser would) and returns its HTML. */
+async function consent(connectUrl) {
+  const page = await fetch(connectUrl);
+  const html = await page.text();
+  assert.match(html, /Allow access to your Nextcloud\?/);
+  const cookie = /ncmcp_consent=[^;]+/.exec(page.headers.get("set-cookie") ?? "")?.[0];
+  const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
+  assert.ok(cookie && csrf, "consent page must set a cookie and carry a CSRF token");
+  const res = await fetch(`${connectUrl}/consent`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Cookie: cookie },
+    body: new URLSearchParams({ csrf }),
+  });
+  assert.equal(res.status, 303);
+  return html;
+}
+
+async function registerRaw(base, redirect = REDIRECT) {
+  const meta = await (await fetch(`${base}/.well-known/oauth-authorization-server`)).json();
+  return fetch(meta.registration_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_name: "test client",
+      redirect_uris: [redirect],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    }),
+  });
 }
 
 async function register(base) {
@@ -116,6 +151,7 @@ async function exchange(base, clientId, code, verifier) {
 /** Full Login Flow sign-in as `user`. Returns the MCP access token. */
 async function signInLoginFlow(nc, base, clientId, user) {
   const { connectUrl, verifier } = await beginAuthorization(base, clientId);
+  await consent(connectUrl);
   const page = await (await fetch(connectUrl)).text();
   assert.match(page, /http-equiv="refresh"/);
   const loginUrl = /href="([^"]*\/login\/v2\/flow\/\w+)"/.exec(page)?.[1];
@@ -225,7 +261,7 @@ describe("hosted mode access restrictions", () => {
       const clientId = await register(server.base);
       const bob = await signInLoginFlow(nc, server.base, clientId, "bob");
       assert.equal(bob.refused, 403);
-      assert.match(bob.page, /nicht freigeschaltet/);
+      assert.match(bob.page, /not enabled for this connector/);
       assert.equal([...nc.state.appPasswords.values()].filter((u) => u === "bob").length, 0);
       const alice = await signInLoginFlow(nc, server.base, clientId, "alice");
       assert.ok(alice.tokens.access_token);
@@ -245,6 +281,7 @@ describe("hosted mode with Nextcloud OAuth2", () => {
     try {
       const clientId = await register(server.base);
       const { connectUrl, verifier } = await beginAuthorization(server.base, clientId);
+      await consent(connectUrl);
       const toNextcloud = await fetch(connectUrl, { redirect: "manual" });
       assert.equal(toNextcloud.status, 303);
       const authorizeUrl = new URL(toNextcloud.headers.get("location"));
@@ -272,6 +309,101 @@ describe("hosted mode with Nextcloud OAuth2", () => {
     } finally {
       server.stop();
       nc.close();
+    }
+  });
+});
+
+describe("hosted mode: who may receive the access (confused deputy)", () => {
+  let nc;
+  before(async () => {
+    nc = await startFakeNextcloud();
+  });
+  after(() => nc?.close());
+
+  it("only lets known redirect URIs register; the list can be extended or replaced via env", async () => {
+    const server = await startHosted({ NEXTCLOUD_URL: nc.base, NEXTCLOUD_MCP_ALLOWED_REDIRECT_URIS: "https://app.example.com/oauth/callback" });
+    try {
+      const evil = await registerRaw(server.base, "https://attacker.example/steal");
+      assert.equal(evil.status, 400);
+      assert.equal((await evil.json()).error, "invalid_redirect_uri");
+      // Look-alikes of allowed hosts do not pass.
+      for (const uri of ["https://claude.ai.attacker.example/api/mcp/auth_callback", "http://localhost.attacker.example/cb", "https://claude.ai/other"]) {
+        assert.equal((await registerRaw(server.base, uri)).status, 400, uri);
+      }
+      for (const uri of [
+        "https://claude.ai/api/mcp/auth_callback",
+        "https://claude.com/api/mcp/auth_callback",
+        "http://localhost:53682/callback",
+        "http://127.0.0.1:8080/",
+        "https://app.example.com/oauth/callback",
+      ]) {
+        assert.equal((await registerRaw(server.base, uri)).status, 201, uri);
+      }
+    } finally {
+      server.stop();
+    }
+    const strict = await startHosted({
+      NEXTCLOUD_URL: nc.base,
+      NEXTCLOUD_MCP_DEFAULT_REDIRECT_URIS: "false",
+      NEXTCLOUD_MCP_ALLOWED_REDIRECT_URIS: "https://claude.ai/api/mcp/auth_callback",
+    });
+    try {
+      assert.equal((await registerRaw(strict.base, "http://localhost:53682/callback")).status, 400);
+      assert.equal((await registerRaw(strict.base, "https://claude.ai/api/mcp/auth_callback")).status, 201);
+    } finally {
+      strict.stop();
+    }
+  });
+
+  it("refuses /authorize for clients registered before the list was narrowed — without redirecting", async () => {
+    const loose = await startHosted({ NEXTCLOUD_URL: nc.base, NEXTCLOUD_MCP_ALLOWED_REDIRECT_URIS: "https://old.example/cb" });
+    const clientId = (await (await registerRaw(loose.base, "https://old.example/cb")).json()).client_id;
+    loose.stop({ keepData: true });
+    await new Promise((r) => setTimeout(r, 300));
+    const narrowed = await startHosted({ NEXTCLOUD_URL: nc.base }, { dir: loose.dir, port: loose.port });
+    try {
+      const url = new URL(`${narrowed.base}/authorize`);
+      url.search = new URLSearchParams({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: "https://old.example/cb",
+        code_challenge: "x".repeat(43),
+        code_challenge_method: "S256",
+      }).toString();
+      const res = await fetch(url, { redirect: "manual" });
+      assert.equal(res.status, 400);
+      assert.equal(res.headers.get("location"), null);
+    } finally {
+      narrowed.stop();
+    }
+  });
+
+  it("shows who asks before anything goes to Nextcloud, and the consent cannot be forged cross-site", async () => {
+    const server = await startHosted({ NEXTCLOUD_URL: nc.base });
+    try {
+      const clientId = await register(server.base);
+      const { connectUrl } = await beginAuthorization(server.base, clientId);
+      const page = await fetch(connectUrl);
+      const html = await page.text();
+      assert.match(html, /“test client”/);
+      assert.match(html, /your own computer<\/b> \(localhost:9999\)/);
+      assert.doesNotMatch(html, /login\/v2\/flow/, "no Nextcloud login before consent");
+      assert.equal(nc.state.flows.size, 0, "no login flow started before consent");
+      assert.match(page.headers.get("set-cookie") ?? "", /HttpOnly; SameSite=Strict/i);
+      const csrf = /name="csrf" value="([^"]+)"/.exec(html)[1];
+
+      // A cross-site form post carries the token from the page source at best, never the Strict cookie.
+      const forged = await fetch(`${connectUrl}/consent`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ csrf }),
+      });
+      assert.equal(forged.status, 403);
+      const stillConsent = await (await fetch(connectUrl)).text();
+      assert.match(stillConsent, /Allow access to your Nextcloud/);
+    } finally {
+      server.stop();
     }
   });
 });

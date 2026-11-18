@@ -1,5 +1,5 @@
 /**
- * HTML for the sign-in pages. Server-rendered, no JavaScript, German UI.
+ * HTML for the sign-in pages. Server-rendered, no JavaScript.
  * The Login Flow page reloads itself every few seconds (meta refresh) and
  * finishes on its own once the person has granted access in Nextcloud.
  */
@@ -34,7 +34,7 @@ export function setPageIcon(href: string, mimeType: string): void {
 }
 
 function layout(title: string, body: string, refreshSeconds?: number): string {
-  return `<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">${refreshSeconds ? `<meta http-equiv="refresh" content="${refreshSeconds}">` : ""}
 <title>${escape(title)}</title>${iconLink}<style>${STYLE}</style></head>
 <body><main>${body}</main></body></html>`;
@@ -43,34 +43,76 @@ function layout(title: string, body: string, refreshSeconds?: number): string {
 export function renderLoginFlowPage(input: { sessionId: string; loginUrl: string; nextcloudHost: string }): string {
   const sid = encodeURIComponent(input.sessionId);
   return layout(
-    "Nextcloud verbinden",
-    `<h1>Nextcloud verbinden</h1>
-    <p class="lead">Melde dich bei <b>${escape(input.nextcloudHost)}</b> an und erlaube den Zugriff. Claude arbeitet danach mit deinen Rechten in Nextcloud.</p>
+    "Connect Nextcloud",
+    `<h1>Connect Nextcloud</h1>
+    <p class="lead">Log in to <b>${escape(input.nextcloudHost)}</b> and grant access. Claude will then work with your Nextcloud permissions.</p>
     <div class="card">
       <ol>
-        <li>„Bei Nextcloud anmelden“ öffnet die Anmeldung in einem neuen Tab.</li>
-        <li>Dort anmelden (mit Zwei-Faktor, falls eingerichtet) und auf <b>Zugriff gewähren</b> klicken.</li>
-        <li>Zurück zu diesem Tab: Er erkennt die Anmeldung selbst und leitet dich zu Claude weiter.</li>
+        <li>“Log in to Nextcloud” opens the login in a new tab.</li>
+        <li>Log in there (with two-factor authentication if set up) and click <b>Grant access</b>.</li>
+        <li>Come back to this tab: it notices the login by itself and takes you back to Claude.</li>
       </ol>
-      <a class="button primary" href="${escape(input.loginUrl)}" target="_blank" rel="noopener noreferrer">Bei Nextcloud anmelden</a>
+      <a class="button primary" href="${escape(input.loginUrl)}" target="_blank" rel="noopener noreferrer">Log in to Nextcloud</a>
       <div class="row">
-        <span class="hint"><span class="spinner"></span>Warte auf die Anmeldung …</span>
-        <form method="post" action="/connect/${sid}/cancel"><button>Abbrechen</button></form>
+        <span class="hint"><span class="spinner"></span>Waiting for the login …</span>
+        <form method="post" action="/connect/${sid}/cancel"><button>Cancel</button></form>
       </div>
     </div>
-    <p class="hint" style="margin-top:20px">Nextcloud legt dafür ein eigenes App-Passwort an. Du findest es unter Einstellungen → Sicherheit → Geräte &amp; Sitzungen und kannst den Zugriff dort jederzeit widerrufen. Dein Nextcloud-Passwort sieht dieser Dienst nie.</p>`,
+    <p class="hint" style="margin-top:20px">Nextcloud creates a dedicated app password for this. You find it under Settings → Security → Devices &amp; sessions and can revoke the access there at any time. This service never sees your Nextcloud password.</p>`,
     3,
+  );
+}
+
+/** Who receives the access, in words a person can check. */
+function describeTarget(redirectUri: string): string {
+  try {
+    const url = new URL(redirectUri);
+    if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+      return `an app on <b>your own computer</b> (${escape(url.host)}), e.g. Claude Code or Claude Desktop`;
+    }
+    return `<b>${escape(url.host)}</b><span class="hint">${escape(url.pathname)}</span>`;
+  } catch {
+    return escape(redirectUri);
+  }
+}
+
+export function renderConsentPage(input: {
+  sessionId: string;
+  csrfToken: string;
+  clientName: string | undefined;
+  redirectUri: string;
+  nextcloudHost: string;
+  writes: boolean;
+}): string {
+  const sid = encodeURIComponent(input.sessionId);
+  const name = input.clientName?.trim() ? `“${escape(input.clientName.trim().slice(0, 100))}”` : "An app without a name";
+  return layout(
+    "Allow access?",
+    `<h1>Allow access to your Nextcloud?</h1>
+    <p class="lead">${name} wants to access <b>${escape(input.nextcloudHost)}</b> with your permissions.</p>
+    <div class="card">
+      <p style="margin-top:0">After you log in, the access goes to:<br>${describeTarget(input.redirectUri)}</p>
+      <p>Allowed: ${input.writes ? "read, search, upload, move and delete files" : "read and search files (no changes)"} — everywhere you have access in Nextcloud, including folders others share with you.</p>
+      <p class="hint">The app name is provided by the app itself and is not verified; the address above is what counts. If you did not start this connection in Claude yourself, cancel.</p>
+      <div class="row">
+        <form method="post" action="/connect/${sid}/cancel"><button>Cancel</button></form>
+        <form method="post" action="/connect/${sid}/consent">
+          <input type="hidden" name="csrf" value="${escape(input.csrfToken)}">
+          <button class="primary">Allow and log in to Nextcloud</button>
+        </form>
+      </div>
+    </div>`,
   );
 }
 
 export function renderDeniedPage(input: { sessionId: string; who: string; reason: string }): string {
   const sid = encodeURIComponent(input.sessionId);
   return layout(
-    "Kein Zugriff",
-    `<h1>Kein Zugriff</h1>
+    "No access",
+    `<h1>No access</h1>
     <p class="lead">${escape(input.who)}: ${escape(input.reason)}</p>
-    <div class="row"><span class="hint">Die Anmeldung wurde in Nextcloud wieder entfernt.</span>
-    <form method="post" action="/connect/${sid}/cancel"><button class="primary">Zurück zu Claude</button></form></div>`,
+    <div class="row"><span class="hint">The login was removed from Nextcloud again.</span>
+    <form method="post" action="/connect/${sid}/cancel"><button class="primary">Back to Claude</button></form></div>`,
   );
 }
 

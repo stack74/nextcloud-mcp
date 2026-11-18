@@ -49,11 +49,14 @@ docker run -p 3000:3000 -v nextcloud-mcp-data:/data \
 
 In claude.ai add a custom connector with the URL `https://nextcloud-mcp.example.com/mcp`. When someone connects it:
 
-1. claude.ai registers itself (dynamic client registration) and sends the person to this server.
-2. **Login Flow v2** (default): a page with a *Log in to Nextcloud* button opens the Nextcloud login in a new tab. After
+1. claude.ai registers itself (dynamic client registration) and sends the person to this server. Only known
+   redirect URIs may register (see [Security](#security)).
+2. A consent page names the app and where the access will go (e.g. claude.ai, or an app on your own computer).
+   Nothing is sent to Nextcloud before the person allows it.
+3. **Login Flow v2** (default): a page with a *Log in to Nextcloud* button opens the Nextcloud login in a new tab. After
    *Grant access* the page notices on its own and returns to claude.ai.
    **OAuth2** (if `NEXTCLOUD_OAUTH_CLIENT_ID/SECRET` are set): the person goes straight to Nextcloud's consent screen.
-3. The server checks `NEXTCLOUD_ALLOWED_GROUPS` / `NEXTCLOUD_ALLOWED_USERS`; refused sign-ins are revoked in Nextcloud
+4. The server checks `NEXTCLOUD_ALLOWED_GROUPS` / `NEXTCLOUD_ALLOWED_USERS`; refused sign-ins are revoked in Nextcloud
    immediately.
 
 Revoking access in Nextcloud makes the next request fail with 401, and claude.ai asks the person to sign in again.
@@ -68,6 +71,8 @@ Connections whose tokens all expired are revoked in Nextcloud by a housekeeping 
 | `NEXTCLOUD_MCP_DB_PATH` | SQLite file, default `/data/nextcloud-mcp.sqlite` in the image |
 | `NEXTCLOUD_ALLOWED_GROUPS`, `NEXTCLOUD_ALLOWED_USERS` | comma-separated; empty = every Nextcloud user may connect |
 | `NEXTCLOUD_ENABLE_WRITES` | `true` registers the write tools |
+| `NEXTCLOUD_MCP_ALLOWED_REDIRECT_URIS` | comma-separated redirect URIs MCP clients may register, **in addition to** the built-in ones (`https://claude.ai/api/mcp/auth_callback`, `https://claude.com/api/mcp/auth_callback`, `http://localhost:*`, `http://127.0.0.1:*`, `http://[::1]:*`). `:*` matches any port; a pattern without a path matches any path |
+| `NEXTCLOUD_MCP_DEFAULT_REDIRECT_URIS` | `false` drops the built-in redirect URIs, so only the ones listed above are allowed |
 | `NEXTCLOUD_OAUTH_CLIENT_ID`, `NEXTCLOUD_OAUTH_CLIENT_SECRET` | use Nextcloud OAuth2; register the client under *Administration → Security → OAuth 2.0 clients* with redirect URI `<public url>/connect/callback` |
 | `NEXTCLOUD_MCP_ICON_PATH` | `.svg`/`.png`/`.ico` served as favicon and announced as server icon |
 | `NEXTCLOUD_MCP_ACCESS_TOKEN_TTL`, `NEXTCLOUD_MCP_REFRESH_TOKEN_TTL` | tokens issued to MCP clients, default 1 h / 90 days |
@@ -76,6 +81,24 @@ Connections whose tokens all expired are revoked in Nextcloud by a housekeeping 
 has no scopes. Login Flow needs no admin setup and creates one revocable app password per connection. OAuth2 shows
 Nextcloud's own consent screen and uses short-lived access tokens, but needs a client registered by an admin, and does
 not support PKCE. Read-only access is enforced by this server (`NEXTCLOUD_ENABLE_WRITES`), not by Nextcloud.
+
+### Security
+
+The hosted server hands out access to Nextcloud with the full permissions of whoever signs in, so it guards against
+the "confused deputy" attack described in the MCP security best practices: someone registers their own client with
+their own redirect URI and sends a colleague the sign-in link — the colleague sees the genuine Nextcloud login, grants
+access, and the code would end up with the attacker. Two independent checks prevent that:
+
+- **Redirect allowlist.** Dynamic client registration only accepts known redirect URIs; `/authorize` checks again, so
+  narrowing the list also locks out clients registered earlier. Loopback addresses are allowed because a code sent
+  there can only reach the signing-in person's own machine.
+- **Consent page.** Before forwarding to Nextcloud the person sees the app's (self-declared) name and, more
+  importantly, the address the access goes to. The form is protected by a CSRF token bound to a `SameSite=Strict`
+  cookie, so another site cannot submit the consent on the person's behalf.
+
+Other measures: Nextcloud credentials are stored AES-256-GCM encrypted; tokens issued to MCP clients are stored as
+SHA-256 hashes; refused sign-ins (allowlists) are revoked in Nextcloud immediately; the sign-in pages send a strict
+CSP and cannot be framed.
 
 ## Tools
 

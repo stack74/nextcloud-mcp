@@ -172,7 +172,7 @@ export function registerFileReadTools(server: McpServer, client: NextcloudClient
       if (args.type === "folders") children = children.filter((e) => e.type === "folder");
       const time = (e: FileEntry): number => (e.modified ? Date.parse(e.modified) : 0);
       const sorters: Record<string, (a: FileEntry, b: FileEntry) => number> = {
-        name: (a, b) => (a.type === b.type ? a.name.localeCompare(b.name, "de", { numeric: true }) : a.type === "folder" ? -1 : 1),
+        name: (a, b) => (a.type === b.type ? a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }) : a.type === "folder" ? -1 : 1),
         newest: (a, b) => time(b) - time(a),
         oldest: (a, b) => time(a) - time(b),
         largest: (a, b) => (b.size ?? 0) - (a.size ?? 0),

@@ -13,6 +13,7 @@
  */
 
 import { normalizeBaseUrl } from "../constants.js";
+import { DEFAULT_REDIRECT_PATTERNS, RedirectPolicy } from "./redirects.js";
 
 export interface HostedConfig {
   /** The Nextcloud everyone connects to. */
@@ -33,6 +34,8 @@ export interface HostedConfig {
   allowedUsers: string[];
   /** Only members of these Nextcloud groups may connect. Both lists empty: everyone. */
   allowedGroups: string[];
+  /** Redirect URIs MCP clients may register (see redirects.ts). */
+  redirects: RedirectPolicy;
   icon?: { path: string; mimeType: string; extension: "svg" | "png" | "ico" };
   /** Lifetime of the access tokens this server issues to MCP clients. */
   accessTokenTtlSeconds: number;
@@ -104,6 +107,20 @@ export function loadHostedConfig(env: NodeJS.ProcessEnv = process.env): HostedCo
     icon = { path: iconPath, mimeType, extension };
   }
 
+  let redirects: RedirectPolicy;
+  // Extra entries extend the built-in list (claude.ai, claude.com, loopback);
+  // NEXTCLOUD_MCP_DEFAULT_REDIRECT_URIS=false drops the built-ins.
+  const withDefaults = !/^(0|false|no)$/i.test(env.NEXTCLOUD_MCP_DEFAULT_REDIRECT_URIS ?? "");
+  const redirectSources = [...(withDefaults ? DEFAULT_REDIRECT_PATTERNS : []), ...list(env.NEXTCLOUD_MCP_ALLOWED_REDIRECT_URIS)];
+  if (redirectSources.length === 0) {
+    fail("no redirect URIs allowed: set NEXTCLOUD_MCP_ALLOWED_REDIRECT_URIS when NEXTCLOUD_MCP_DEFAULT_REDIRECT_URIS=false");
+  }
+  try {
+    redirects = new RedirectPolicy(redirectSources);
+  } catch (error) {
+    fail(`NEXTCLOUD_MCP_ALLOWED_REDIRECT_URIS: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
   return {
     nextcloudUrl,
     publicUrl,
@@ -117,6 +134,7 @@ export function loadHostedConfig(env: NodeJS.ProcessEnv = process.env): HostedCo
     writes: /^(1|true|yes)$/i.test(env.NEXTCLOUD_ENABLE_WRITES ?? ""),
     allowedUsers: list(env.NEXTCLOUD_ALLOWED_USERS),
     allowedGroups: list(env.NEXTCLOUD_ALLOWED_GROUPS),
+    redirects,
     ...(icon ? { icon } : {}),
     accessTokenTtlSeconds: intEnv(env, "NEXTCLOUD_MCP_ACCESS_TOKEN_TTL", 3600),
     refreshTokenTtlSeconds: intEnv(env, "NEXTCLOUD_MCP_REFRESH_TOKEN_TTL", 90 * 24 * 3600),

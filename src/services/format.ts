@@ -36,12 +36,25 @@ export function formatBytes(bytes: number | null | undefined): string {
   return `${unit === 0 ? value : value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
-/** "2026-11-18 21:04" in Europe/Berlin — compact and unambiguous enough for a table. */
+/** Time zone for dates in markdown output: NEXTCLOUD_TIMEZONE, else the system's (TZ). */
+const TIME_ZONE = (() => {
+  const zone = process.env.NEXTCLOUD_TIMEZONE?.trim();
+  if (!zone) return undefined;
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: zone });
+    return zone;
+  } catch {
+    return undefined;
+  }
+})();
+
+/** "2026-11-18 21:04" — compact and unambiguous for a table. JSON output keeps ISO 8601 UTC. */
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return "–";
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
-  return date.toLocaleString("sv-SE", { timeZone: "Europe/Berlin", dateStyle: "short", timeStyle: "short" });
+  // The sv-SE locale formats as YYYY-MM-DD HH:MM.
+  return date.toLocaleString("sv-SE", { ...(TIME_ZONE ? { timeZone: TIME_ZONE } : {}), dateStyle: "short", timeStyle: "short" });
 }
 
 const cell = (value: string): string => value.replace(/\|/g, "\\|").replace(/\n/g, " ");

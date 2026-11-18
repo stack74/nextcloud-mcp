@@ -1,6 +1,6 @@
 {
   "name": "nextcloud-mcp",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "MCP server for Nextcloud files: list, search, read, preview, download, upload, create, move and delete. Local (stdio) or hosted (Streamable HTTP + OAuth); people sign in with their own Nextcloud login.",
   "type": "module",
   "main": "dist/index.js",

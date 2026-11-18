@@ -33,6 +33,10 @@ export interface SessionRow {
   login_url: string | null;
   poll_token: string | null;
   poll_expires_at: number | null;
+  /** The person approved this client on the consent page. */
+  consented: boolean;
+  /** SHA-256 of the consent form's CSRF token (also sent as a SameSite=Strict cookie). */
+  consent_token_hash: string | null;
   expires_at: number;
 }
 
@@ -101,7 +105,15 @@ export class Store {
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA);
+    this.migrate();
     this.key = Buffer.from(hkdfSync("sha256", secret, "nextcloud-mcp", "credential-encryption", 32));
+  }
+
+  /** Adds columns introduced after a database was created. */
+  private migrate(): void {
+    const columns = new Set((this.db.prepare("PRAGMA table_info(sessions)").all() as { name: string }[]).map((c) => c.name));
+    if (!columns.has("consented")) this.db.exec("ALTER TABLE sessions ADD COLUMN consented INTEGER NOT NULL DEFAULT 0");
+    if (!columns.has("consent_token_hash")) this.db.exec("ALTER TABLE sessions ADD COLUMN consent_token_hash TEXT");
   }
 
   close(): void {
@@ -158,6 +170,8 @@ export class Store {
       login_url: row.login_url === null ? null : String(row.login_url),
       poll_token: row.poll_token === null ? null : this.decrypt(String(row.poll_token)),
       poll_expires_at: row.poll_expires_at === null ? null : Number(row.poll_expires_at),
+      consented: Number(row.consented) === 1,
+      consent_token_hash: row.consent_token_hash === null || row.consent_token_hash === undefined ? null : String(row.consent_token_hash),
       expires_at: Number(row.expires_at),
     };
   }
@@ -166,6 +180,17 @@ export class Store {
     this.db
       .prepare("UPDATE sessions SET login_url = ?, poll_token = ?, poll_expires_at = ? WHERE id = ?")
       .run(loginUrl, this.encrypt(pollToken), expiresAt, sessionId);
+  }
+
+  /** Starts a consent form: returns the CSRF token for the form and the cookie. */
+  createConsentToken(sessionId: string): string {
+    const token = randomToken();
+    this.db.prepare("UPDATE sessions SET consent_token_hash = ? WHERE id = ?").run(sha256(token), sessionId);
+    return token;
+  }
+
+  markConsented(sessionId: string): void {
+    this.db.prepare("UPDATE sessions SET consented = 1, consent_token_hash = NULL WHERE id = ?").run(sessionId);
   }
 
   /** OAuth mode: the `state` sent to Nextcloud. Returns the value to send. */

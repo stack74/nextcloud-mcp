@@ -11,6 +11,7 @@
  *   GET  /healthz                                           liveness
  */
 
+import { timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import express, { type Request, type Response } from "express";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
@@ -30,9 +31,9 @@ import {
   startLoginFlow,
 } from "../services/loginflow.js";
 import { type HostedConfig, loadHostedConfig } from "./config.js";
-import { renderDeniedPage, renderLoginFlowPage, renderMessage, setPageIcon } from "./pages.js";
+import { renderConsentPage, renderDeniedPage, renderLoginFlowPage, renderMessage, setPageIcon } from "./pages.js";
 import { HostedOAuthProvider } from "./provider.js";
-import { type GrantRow, type SessionRow, Store } from "./store.js";
+import { type GrantRow, type SessionRow, Store, sha256 } from "./store.js";
 import { GrantCredentials, NextcloudOAuth, UpstreamOAuthError } from "./upstream.js";
 
 export interface HostedApp {
@@ -48,7 +49,7 @@ function refusal(config: HostedConfig, user: NextcloudUser): string | undefined 
   if (config.allowedUsers.length === 0 && config.allowedGroups.length === 0) return undefined;
   if (config.allowedUsers.includes(user.id)) return undefined;
   if (user.groups.some((g) => config.allowedGroups.includes(g))) return undefined;
-  return "Dein Nextcloud-Konto ist für diesen Claude-Connector nicht freigeschaltet. Wende dich an die Administration.";
+  return "Your Nextcloud account is not enabled for this connector. Please contact your administrator.";
 }
 
 export async function createHostedApp(config: HostedConfig): Promise<HostedApp> {
@@ -104,12 +105,12 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     res
       .status(400)
       .type("html")
-      .send(renderMessage("Link abgelaufen", "Diese Anmeldung ist nicht mehr gültig. Starte die Verbindung in Claude erneut."));
+      .send(renderMessage("Link expired", "This sign-in is no longer valid. Start the connection in Claude again."));
   };
 
   const failed = (res: Response, text: string): void => {
     pageHeaders(res);
-    res.status(502).type("html").send(renderMessage("Anmeldung fehlgeschlagen", text));
+    res.status(502).type("html").send(renderMessage("Sign-in failed", text));
   };
 
   /**
@@ -129,7 +130,7 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     } catch (error) {
       console.error(`Sign-in: cannot read the Nextcloud user: ${error instanceof Error ? error.message : String(error)}`);
       await revokeCredentials(config.nextcloudUrl, authorization);
-      return failed(res, "Nextcloud hat die neue Anmeldung nicht bestätigt. Bitte versuche es erneut.");
+      return failed(res, "Nextcloud did not confirm the new login. Please try again.");
     }
 
     const refused = refusal(config, user);
@@ -174,8 +175,8 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
       return failed(
         res,
         error instanceof UpstreamOAuthError && error.permanent
-          ? "Nextcloud hat die Anmeldung abgelehnt. Prüfe Client-ID und Secret des OAuth-Clients in Nextcloud."
-          : "Nextcloud ist gerade nicht erreichbar. Bitte versuche es gleich erneut.",
+          ? "Nextcloud refused the sign-in. Check the client ID and secret of the OAuth client in Nextcloud."
+          : "Nextcloud cannot be reached right now. Please try again shortly.",
       );
     }
     await finish(res, session, "oauth", `Bearer ${tokens.accessToken}`, {
@@ -186,9 +187,72 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
     });
   });
 
+  // --- consent -------------------------------------------------------------
+  //
+  // Before anything goes to Nextcloud, the person sees which client asks and
+  // where the access will end up (MCP security best practices: a proxy must get
+  // consent per dynamically registered client). The form carries a CSRF token
+  // that must match a SameSite=Strict cookie, so another site cannot submit the
+  // consent on the person's behalf and drop them straight into the Nextcloud login.
+
+  const CONSENT_COOKIE = "ncmcp_consent";
+  const consentCookiePath = (sid: string): string => `/connect/${encodeURIComponent(sid)}`;
+  const readCookie = (req: Request, name: string): string | undefined => {
+    for (const part of (req.headers.cookie ?? "").split(";")) {
+      const [key, ...rest] = part.trim().split("=");
+      if (key === name) return decodeURIComponent(rest.join("="));
+    }
+    return undefined;
+  };
+  const sameToken = (a: string, b: string): boolean => {
+    const x = Buffer.from(a);
+    const y = Buffer.from(b);
+    return x.length === y.length && timingSafeEqual(x, y);
+  };
+
+  const showConsent = (res: Response, session: SessionRow): void => {
+    const token = store.createConsentToken(session.id);
+    res.cookie(CONSENT_COOKIE, token, {
+      httpOnly: true,
+      secure: config.publicUrl.protocol === "https:",
+      sameSite: "strict",
+      path: consentCookiePath(session.id),
+      maxAge: 30 * 60 * 1000,
+    });
+    pageHeaders(res);
+    res.type("html").send(
+      renderConsentPage({
+        sessionId: session.id,
+        csrfToken: token,
+        clientName: store.getClient(session.client_id)?.client_name,
+        redirectUri: session.redirect_uri,
+        nextcloudHost,
+        writes: config.writes,
+      }),
+    );
+  };
+
+  app.post("/connect/:sid/consent", express.urlencoded({ extended: false, limit: "2kb" }), (req, res) => {
+    const session = store.getSession(String(req.params.sid));
+    if (!session) return expired(res);
+    const form = typeof req.body?.csrf === "string" ? req.body.csrf : "";
+    const cookie = readCookie(req, CONSENT_COOKIE) ?? "";
+    const valid = Boolean(form) && sameToken(form, cookie) && session.consent_token_hash !== null && sameToken(sha256(form), session.consent_token_hash);
+    if (!valid) {
+      console.error(`Consent refused for session (client ${session.client_id}): CSRF token missing or wrong`);
+      pageHeaders(res);
+      res.status(403).type("html").send(renderMessage("Not confirmed", "Your consent could not be verified. Start the connection in Claude again."));
+      return;
+    }
+    store.markConsented(session.id);
+    res.clearCookie(CONSENT_COOKIE, { path: consentCookiePath(session.id) });
+    res.redirect(303, `/connect/${encodeURIComponent(session.id)}`);
+  });
+
   app.get("/connect/:sid", async (req, res) => {
     const session = store.getSession(String(req.params.sid));
     if (!session) return expired(res);
+    if (!session.consented) return showConsent(res, session);
 
     if (oauth) {
       res.redirect(303, oauth.authorizationUrl(store.createUpstreamState(session.id)));
@@ -223,7 +287,7 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
       flow = await startLoginFlow(config.nextcloudUrl);
     } catch (error) {
       console.error(`Cannot start Login Flow: ${error instanceof Error ? error.message : String(error)}`);
-      return failed(res, `${nextcloudHost} ist gerade nicht erreichbar. Bitte versuche es gleich erneut.`);
+      return failed(res, `${nextcloudHost} cannot be reached right now. Please try again shortly.`);
     }
     store.setLoginFlow(session.id, flow.loginUrl, flow.pollToken, now + LOGIN_FLOW_TTL_SECONDS - 30);
     pageHeaders(res);
@@ -275,7 +339,7 @@ export async function createHostedApp(config: HostedConfig): Promise<HostedApp> 
 
   app.get("/", (_req, res) => {
     pageHeaders(res);
-    res.type("html").send(renderMessage("Nextcloud MCP", `Dieser Server stellt ${nextcloudHost} als MCP-Connector bereit. Connector-URL: ${config.mcpUrl.href}`));
+    res.type("html").send(renderMessage("Nextcloud MCP", `This server provides ${nextcloudHost} as an MCP connector. Connector URL: ${config.mcpUrl.href}`));
   });
 
   const housekeeping = async (): Promise<void> => {

@@ -25,11 +25,11 @@ interface Match {
 
 function findMatches(text: string, needle: string, caseSensitive: boolean, max: number): { matches: Match[]; count: number } {
   const lines = text.split(/\r?\n/);
-  const want = caseSensitive ? needle : needle.toLocaleLowerCase("de");
+  const want = caseSensitive ? needle : needle.toLocaleLowerCase();
   const matches: Match[] = [];
   let count = 0;
   lines.forEach((raw, index) => {
-    const hay = caseSensitive ? raw : raw.toLocaleLowerCase("de");
+    const hay = caseSensitive ? raw : raw.toLocaleLowerCase();
     const at = hay.indexOf(want);
     if (at === -1) return;
     count++;
